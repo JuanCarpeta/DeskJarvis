@@ -1,52 +1,15 @@
+"""Herramientas publicas de archivos para el cerebro: buscar, abrir, leer y crear.
+
+El recorrido del disco vive en core/scanner.py y el acceso a la base en
+core/database.py; este modulo es solo la cara visible que usa el cerebro.
+"""
+
 import os
 import re
-import sqlite3
-import time
-import unicodedata
 from pathlib import Path
 
-try:
-    import psutil
-except ModuleNotFoundError:
-    psutil = None
-
-BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-DB = os.path.join(BASE, "archivos.db")
-
-# Horas que se acepta la base sin volver a recorrer el disco
-HORAS_INDICE = 12
-# Subir esto obliga a reconstruir la base (por ejemplo al cambiar que se guarda)
-VERSION_INDICE = "2"
-# Segundos maximos de rastreo en vivo si la base no encuentra nada
-SEG_BUSQUEDA_VIVA = 15
-
-
-def discos(incluir_extraibles=True):
-    """Devuelve las raices de las unidades reales del PC (C:\\, D:\\, ...)."""
-    if psutil is None:
-        return [Path.home()]
-    raices = []
-    for p in psutil.disk_partitions(all=False):
-        opts = p.opts.lower()
-        fstype = p.fstype.lower()
-        if "cdrom" in opts or "remote" in opts:
-            continue
-        if fstype in ("", "iso9660", "udf"):
-            continue
-        if not incluir_extraibles and "removable" in opts:
-            continue
-        raices.append(Path(p.mountpoint))
-    return raices if raices else [Path.home()]
-
-
-CARPETAS = discos()
-
-EXCLUIR = {
-    "AppData", "node_modules", ".git", "__pycache__", "venv", ".venv",
-    "Windows", "Program Files", "Program Files (x86)", "ProgramData",
-    "System32", "$Recycle.Bin", "Recovery", "PerfLogs",
-    "System Volume Information", "$WinREAgent",
-}
+from core import database
+from core.scanner import buscar_en_vivo, indexar, normalizar, puntuar, tokens
 
 EXT_TEXTO = {
     ".txt", ".md", ".csv", ".log", ".json", ".xml", ".html", ".htm",
@@ -55,35 +18,6 @@ EXT_TEXTO = {
 }
 
 MAX_BYTES = 2_000_000
-
-# Palabras del lenguaje natural que no sirven para comparar nombres de archivo
-PARADAS = {
-    "de", "del", "la", "el", "los", "las", "lo", "un", "una", "unos", "unas",
-    "archivo", "archivos", "documento", "documentos", "carpeta", "busca",
-    "buscar", "buscame", "encuentra", "encuentrame", "hay", "que", "se",
-    "llama", "llamado", "llamada", "mi", "mis", "por", "para", "con", "en",
-    "y", "o", "donde", "esta", "estan", "favor", "abre", "abreme", "abrir",
-    "lee", "leeme", "leer", "muestra", "contenido", "ejecuta", "lanza",
-    "ve", "vaya", "vayas", "ir", "vete", "dirigete", "navega", "navegar",
-    "lleva", "llevame", "entra", "entrar",
-}
-
-
-# Carpeta en la que Jarvis esta "ubicado" sin abrir ninguna ventana
-_directorio_actual = str(Path.home())
-
-
-def normalizar(texto):
-    """Minusculas, sin acentos y con espacios alrededor (comparar por palabras)."""
-    texto = unicodedata.normalize("NFKD", str(texto).lower())
-    texto = "".join(c for c in texto if unicodedata.category(c) != "Mn")
-    texto = re.sub(r"[^a-z0-9]+", " ", texto)
-    return " " + texto.strip() + " "
-
-
-def _tokens(consulta):
-    return [t for t in normalizar(consulta).split() if len(t) > 1 and t not in PARADAS]
-
 
 RUTA_RE = re.compile(r'([A-Za-z]:[\\/][^"\'<>|?*\r\n]*)')
 
@@ -149,187 +83,21 @@ def resolver_objetivo(texto):
     return extraer_ruta(texto) or ruta_conocida(texto)
 
 
-def _conectar():
-    con = sqlite3.connect(DB)
-    con.execute(
-        """CREATE TABLE IF NOT EXISTS archivos (
-               ruta TEXT PRIMARY KEY,
-               nombre TEXT,
-               ext TEXT,
-               tamano INTEGER,
-               modificado REAL,
-               nombre_norm TEXT
-           )"""
-    )
-    columnas = {c[1] for c in con.execute("PRAGMA table_info(archivos)")}
-    if "nombre_norm" not in columnas:
-        con.execute("ALTER TABLE archivos ADD COLUMN nombre_norm TEXT")
-        filas = con.execute("SELECT ruta, nombre FROM archivos").fetchall()
-        con.executemany(
-            "UPDATE archivos SET nombre_norm = ? WHERE ruta = ?",
-            [(normalizar(n or ""), r) for r, n in filas],
-        )
-    con.execute("CREATE INDEX IF NOT EXISTS idx_nombre ON archivos(nombre)")
-    con.execute("CREATE INDEX IF NOT EXISTS idx_norm ON archivos(nombre_norm)")
-    con.execute("CREATE TABLE IF NOT EXISTS meta (clave TEXT PRIMARY KEY, valor TEXT)")
-    con.commit()
-    return con
-
-
-def _ultima_indexacion(con):
-    try:
-        fila = con.execute("SELECT valor FROM meta WHERE clave='ultima_indexacion'").fetchone()
-        return float(fila[0]) if fila else 0.0
-    except Exception:
-        return 0.0
-
-
-def _version_indice(con):
-    try:
-        fila = con.execute("SELECT valor FROM meta WHERE clave='version_indice'").fetchone()
-        return fila[0] if fila else ""
-    except Exception:
-        return ""
-
-
-def indexar(raices=None, max_archivos=1000000, forzar=False):
-    """Recorre las unidades y guarda nombre/ruta/tamano en archivos.db."""
-    raices = raices or CARPETAS
-    con = _conectar()
-    total_db = con.execute("SELECT COUNT(*) FROM archivos").fetchone()[0]
-    if (not forzar and total_db and _version_indice(con) == VERSION_INDICE
-            and (time.time() - _ultima_indexacion(con)) < HORAS_INDICE * 3600):
-        con.close()
-        return total_db
-
-    con.execute("DELETE FROM archivos")
-    total = 0
-    lote = []
-
-    def volcar():
-        nonlocal lote
-        if lote:
-            con.executemany("INSERT OR REPLACE INTO archivos VALUES (?,?,?,?,?,?)", lote)
-            lote = []
-
-    def agregar(ruta, nombre, ext, tamano, modificado):
-        nonlocal total
-        lote.append((ruta, nombre.lower(), ext, tamano, modificado, normalizar(nombre)))
-        total += 1
-        if len(lote) >= 1000:
-            volcar()
-
-    lleno = False
-    for raiz in raices:
-        raiz = Path(raiz)
-        if not raiz.exists():
-            continue
-        for dirpath, dirnames, filenames in os.walk(raiz, onerror=lambda e: None):
-            dirnames[:] = [d for d in dirnames if d not in EXCLUIR and not d.startswith(".")]
-            for nombre in dirnames:
-                agregar(os.path.join(dirpath, nombre), nombre, "", 0, 0.0)
-                if total >= max_archivos:
-                    lleno = True
-                    break
-            if lleno:
-                break
-            for nombre in filenames:
-                ruta = os.path.join(dirpath, nombre)
-                try:
-                    st = os.stat(ruta)
-                except OSError:
-                    continue
-                agregar(ruta, nombre, os.path.splitext(nombre)[1].lower(),
-                        st.st_size, st.st_mtime)
-                if total >= max_archivos:
-                    lleno = True
-                    break
-            if lleno:
-                break
-        if lleno:
-            break
-    volcar()
-    con.execute("INSERT OR REPLACE INTO meta VALUES ('ultima_indexacion', ?)", (str(time.time()),))
-    con.execute("INSERT OR REPLACE INTO meta VALUES ('version_indice', ?)", (VERSION_INDICE,))
-    con.commit()
-    con.close()
-    return total
-
-
-def _puntuar(nombre_norm, consulta_norm):
-    """Mas puntos si el nombre coincide completo o empieza igual."""
-    n = nombre_norm.strip()
-    c = consulta_norm.strip()
-    if n == c:
-        return 100
-    if n.startswith(c):
-        return 60
-    return 0
-
-
-def _buscar_en_db(con, tokens, consulta_norm, limite):
+def buscar_en_db(con, tokens_consulta, consulta_norm, limite):
     # Cada palabra debe aparecer como palabra completa dentro del nombre,
     # asi "taller" ya no confunde con "installer".
     sql = "SELECT ruta, nombre, nombre_norm, tamano, modificado FROM archivos WHERE 1=1"
     params = []
-    for t in tokens[:6]:
+    for t in tokens_consulta[:6]:
         sql += " AND nombre_norm LIKE ?"
         params.append(f"% {t}%")
     sql += " LIMIT 3000"
     filas = con.execute(sql, params).fetchall()
     if not filas:
         return []
-    filas.sort(key=lambda f: (-_puntuar(f[2] or "", consulta_norm), -(f[4] or 0)))
+    filas.sort(key=lambda f: (-puntuar(f[2] or "", consulta_norm), -(f[4] or 0)))
     return [{"ruta": f[0], "nombre": f[1], "tamano": f[3], "modificado": f[4]}
             for f in filas[:limite]]
-
-
-def _buscar_en_vivo(tokens, consulta_norm, limite):
-    """Rastrea la carpeta del usuario por si el archivo es nuevo y no esta en la base."""
-    inicio = time.time()
-    encontrados = []
-    con = _conectar()
-    try:
-        for dirpath, dirnames, filenames in os.walk(Path.home(), onerror=lambda e: None):
-            dirnames[:] = [d for d in dirnames if d not in EXCLUIR and not d.startswith(".")]
-            for nombre in dirnames:
-                nn = normalizar(nombre)
-                if all((" " + t) in nn for t in tokens):
-                    ruta = os.path.join(dirpath, nombre)
-                    con.execute("INSERT OR REPLACE INTO archivos VALUES (?,?,?,?,?,?)",
-                                (ruta, nombre.lower(), "", 0, 0.0, nn))
-                    encontrados.append({"ruta": ruta, "nombre": nombre.lower(),
-                                        "tamano": 0, "modificado": 0.0})
-                    if len(encontrados) >= limite:
-                        raise StopIteration
-            for nombre in filenames:
-                nn = normalizar(nombre)
-                if all((" " + t) in nn for t in tokens):
-                    ruta = os.path.join(dirpath, nombre)
-                    try:
-                        st = os.stat(ruta)
-                    except OSError:
-                        continue
-                    con.execute("INSERT OR REPLACE INTO archivos VALUES (?,?,?,?,?,?)",
-                                (ruta, nombre.lower(), os.path.splitext(nombre)[1].lower(),
-                                 st.st_size, st.st_mtime, nn))
-                    encontrados.append({"ruta": ruta, "nombre": nombre.lower(),
-                                        "tamano": st.st_size, "modificado": st.st_mtime})
-                    if len(encontrados) >= limite:
-                        raise StopIteration
-            if time.time() - inicio > SEG_BUSQUEDA_VIVA:
-                break
-        con.commit()
-    except StopIteration:
-        con.commit()
-    except Exception as e:
-        # Antes se ignoraba en silencio y la busqueda parecia "no encontrado".
-        print(f"(busqueda en vivo incompleta: {e})")
-    finally:
-        con.close()
-    encontrados.sort(key=lambda f: (-_puntuar(normalizar(f["nombre"]), consulta_norm),
-                                    -(f["modificado"] or 0)))
-    return encontrados[:limite]
 
 
 def buscar(consulta, limite=10):
@@ -337,18 +105,22 @@ def buscar(consulta, limite=10):
     consulta = (consulta or "").strip()
     if not consulta:
         return []
-    tokens = _tokens(consulta)
-    if not tokens:
-        tokens = [t for t in normalizar(consulta).split() if t] or [consulta.lower()]
-    consulta_norm = normalizar(" ".join(tokens))
-    con = _conectar()
+    toks = tokens(consulta)
+    if not toks:
+        toks = [t for t in normalizar(consulta).split() if t] or [consulta.lower()]
+    consulta_norm = normalizar(" ".join(toks))
+    con = database.conectar()
     try:
-        resultados = _buscar_en_db(con, tokens, consulta_norm, limite)
+        resultados = buscar_en_db(con, toks, consulta_norm, limite)
     finally:
         con.close()
     if resultados:
         return resultados
-    return _buscar_en_vivo(tokens, consulta_norm, limite)
+    return buscar_en_vivo(toks, consulta_norm, limite)
+
+
+# Carpeta en la que Jarvis esta "ubicado" sin abrir ninguna ventana
+_directorio_actual = str(Path.home())
 
 
 def directorio_actual():
