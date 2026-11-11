@@ -1,0 +1,11 @@
+faster-whisper
+numpy
+ollama
+openpyxl
+psutil
+pypdf
+python-docx
+python-pptx
+pyttsx3
+reportlab
+sounddevice
