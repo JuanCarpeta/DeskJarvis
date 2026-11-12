@@ -60,7 +60,8 @@ def ruta_conocida(texto):
     claves_disco = ("disco local", "disco duro", "unidad c", "disco c",
                     "mi pc", "este equipo", "mi computadora", "mi computador")
     if any(f" {k} " in t for k in claves_disco):
-        return str(Path(os.environ.get("SystemDrive", "C:") + "\\"))
+        unidad = os.environ.get("SystemDrive")
+        return os.path.abspath(unidad + os.sep) if unidad else os.path.abspath(os.sep)
     mapa = {
         "escritorio": ("Desktop", "Escritorio"),
         "desktop": ("Desktop", "Escritorio"),

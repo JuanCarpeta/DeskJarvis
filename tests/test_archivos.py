@@ -293,6 +293,31 @@ class TestEstadisticas(BaseConDBTemporal):
         self.assertIn("secreta", meta["carpetas_inaccesibles"])
 
 
+class TestErroresDeIteracion(unittest.TestCase):
+    def test_error_al_iterar_se_registra_y_no_aborta(self):
+        estadisticas = scanner.Estadisticas()
+
+        class IteradorRoto:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+            def __iter__(self):
+                return self
+
+            def __next__(self):
+                raise OSError("fallo a mitad del listado")
+
+        with mock.patch("core.scanner._scandir", return_value=IteradorRoto()):
+            grupos = list(scanner.recorrer("C:\\carpeta", estadisticas))
+
+        self.assertEqual(grupos, [])
+        self.assertEqual(estadisticas.total_errores, 1)
+        self.assertEqual(estadisticas.errores[DESCONOCIDO], 1)
+
+
 class TestClasificacionErrores(unittest.TestCase):
     def _con_winerror(self, numero):
         error = OSError("prueba")

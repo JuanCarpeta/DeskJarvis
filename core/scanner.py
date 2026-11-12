@@ -170,24 +170,30 @@ def recorrer(raiz, estadisticas, excluir=None, presupuesto_seg=None):
             continue
         hijos = []
         with iterador:
-            for entry in iterador:
-                if tope is not None and time.monotonic() > tope:
-                    return
-                nombre = entry.name
-                st = _stat_entrada(entry, estadisticas)
-                if st is None:
-                    continue
-                es_carpeta = stat_mod.S_ISDIR(st.st_mode)
-                if es_carpeta and (nombre in excluir or nombre.startswith(".")):
-                    continue
-                if _es_enlace(entry, st):
-                    estadisticas.registrar_enlace(os.path.join(carpeta, nombre))
-                    continue
-                ruta = os.path.join(carpeta, nombre)
-                hijos.append(Entrada(ruta, nombre, es_carpeta, st.st_size,
-                                     st.st_mtime, st.st_mtime_ns))
-                if es_carpeta:
-                    pila.append(ruta)
+            try:
+                for entry in iterador:
+                    if tope is not None and time.monotonic() > tope:
+                        return
+                    nombre = entry.name
+                    st = _stat_entrada(entry, estadisticas)
+                    if st is None:
+                        continue
+                    es_carpeta = stat_mod.S_ISDIR(st.st_mode)
+                    if es_carpeta and (nombre in excluir or nombre.startswith(".")):
+                        continue
+                    if _es_enlace(entry, st):
+                        estadisticas.registrar_enlace(os.path.join(carpeta, nombre))
+                        continue
+                    ruta = os.path.join(carpeta, nombre)
+                    hijos.append(Entrada(ruta, nombre, es_carpeta, st.st_size,
+                                         st.st_mtime, st.st_mtime_ns))
+                    if es_carpeta:
+                        pila.append(ruta)
+            except OSError as error:
+                # Un fallo a mitad del listado deja el grupo incompleto: se
+                # registra y no se reconcilia esa carpeta para no borrar filas.
+                estadisticas.registrar_error(error, carpeta)
+                continue
         yield carpeta, hijos
 
 

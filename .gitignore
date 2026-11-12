@@ -30,3 +30,6 @@ Thumbs.db
 # Modelos descargados y cachés
 models/
 .cache/
+
+# Paquetes de entrega
+*.zip

@@ -201,25 +201,27 @@ class TestListarYNavegar(unittest.TestCase):
             cerebro._intencion("muestrame el contenido de informe"), "leer")
 
     def test_listado_no_navega(self):
-        original_listar = cerebro.listar
-        original_navegar = cerebro.navegar
-        capturado = {}
+        with tempfile.TemporaryDirectory() as temporal:
+            original_listar = cerebro.listar
+            original_navegar = cerebro.navegar
+            capturado = {}
 
-        def falso_listar(ruta):
-            capturado["ruta"] = ruta
-            return "listado"
+            def falso_listar(ruta):
+                capturado["ruta"] = ruta
+                return "listado"
 
-        cerebro.listar = falso_listar
-        cerebro.navegar = lambda ruta: self.fail("no debio navegar")
-        try:
-            respuesta = cerebro._responder_directo(
-                "dime que hay en C:\\", "listar")
-        finally:
-            cerebro.listar = original_listar
-            cerebro.navegar = original_navegar
+            cerebro.listar = falso_listar
+            cerebro.navegar = lambda ruta: self.fail("no debio navegar")
+            try:
+                respuesta = cerebro._responder_directo(
+                    f"dime que hay en {temporal}", "listar")
+            finally:
+                cerebro.listar = original_listar
+                cerebro.navegar = original_navegar
 
         self.assertEqual(respuesta, "listado")
-        self.assertTrue(capturado["ruta"].startswith("C:"))
+        self.assertEqual(os.path.normcase(capturado["ruta"]),
+                         os.path.normcase(temporal))
 
     def test_disco_local_va_a_la_raiz(self):
         original_navegar = cerebro.navegar
@@ -230,9 +232,10 @@ class TestListarYNavegar(unittest.TestCase):
         finally:
             cerebro.navegar = original_navegar
 
-        unidad, resto = os.path.splitdrive(capturado["ruta"])
-        self.assertTrue(unidad)
-        self.assertEqual(resto, "\\")
+        esperado = os.path.abspath(
+            (os.environ.get("SystemDrive") or "") + os.sep)
+        self.assertEqual(os.path.normcase(os.path.abspath(capturado["ruta"])),
+                         os.path.normcase(esperado))
 
     def test_navega_carpeta_relativa_a_la_actual(self):
         with tempfile.TemporaryDirectory() as temporal:
