@@ -116,6 +116,10 @@ def main():
     if not adquirir_instancia():
         return
 
+    from core import database
+
+    database.inicializar()
+
     actualizar_inventario()
     if MODO_TEXTO:
         main_texto()

@@ -192,11 +192,15 @@ def recorrer(raiz, estadisticas, excluir=None, presupuesto_seg=None):
 
 
 def _firma_grupo(grupo):
-    """Hash de los hijos de una carpeta: detecta altas, bajas y modificaciones."""
-    partes = [f"{e.nombre}|{int(e.es_carpeta)}|{e.tamano}|{e.mtime_ns}\n"
-              for e in grupo]
+    partes = [
+        f"{e.nombre}|{int(e.es_carpeta)}|{e.tamano}|{e.mtime_ns}\n"
+        for e in sorted(grupo, key=lambda x: x.nombre.casefold())
+    ]
+
     return hashlib.blake2b(
-        "".join(partes).encode("utf-8", "surrogatepass"), digest_size=20).hexdigest()
+        "".join(partes).encode("utf-8", "surrogatepass"),
+        digest_size=20
+    ).hexdigest()
 
 
 def _firma(entrada):
@@ -238,6 +242,81 @@ def _reciente(con):
         return bool(ultimo) and time.time() - float(ultimo) < SEG_ENTRE_ESCANEOS
     except ValueError:
         return False
+
+
+def _accesible(ruta):
+    return os.path.isdir(_ruta_extendida(str(ruta)))
+
+
+def _sincronizar_unidades(con, raices):
+    """Marca activas/desconectadas y devuelve las que hay que volver a escanear.
+
+    Las filas de archivos de una unidad desconectada se conservan: la busqueda
+    las filtra por estado. Al reconectar, se fuerza el escaneo de esa unidad
+    aunque el escaneo global sea reciente.
+    """
+    actuales = list(dict.fromkeys(str(r) for r in raices))
+    conocidas = {
+        f[0]: (f[1], f[2]) for f in con.execute(
+            "SELECT ruta, estado, ultima_revision FROM unidades")
+    }
+    reconectadas = set()
+    for ruta in actuales:
+        disponible = _accesible(ruta)
+        estado = "activa" if disponible else "desconectada"
+        anterior, revision = conocidas.get(ruta, (None, None))
+        if disponible and (anterior != "activa" or revision is None):
+            reconectadas.add(ruta)
+        if anterior != estado:
+            con.execute(
+                "INSERT OR IGNORE INTO unidades (ruta, ultima_revision, estado) "
+                "VALUES (?, NULL, ?)", (ruta, estado))
+            con.execute(
+                "UPDATE unidades SET estado = ? WHERE ruta = ?", (estado, ruta))
+    for ruta, (estado, _revision) in conocidas.items():
+        if ruta in actuales or _accesible(ruta):
+            continue
+        if estado != "desconectada":
+            con.execute(
+                "UPDATE unidades SET estado = 'desconectada' WHERE ruta = ?",
+                (ruta,))
+    con.commit()
+    return reconectadas
+
+
+def refrescar_unidades(con):
+    """Comprueba si las unidades siguen accesibles, sin recorrer su contenido.
+
+    Se usa antes de buscar para que una unidad desconectada desaparezca de los
+    resultados de inmediato, y para reactivarla si vuelve a conectarse.
+    """
+    cambiado = False
+    for ruta, estado in database.leer_unidades(con):
+        nuevo = "activa" if _accesible(ruta) else "desconectada"
+        if nuevo != estado:
+            if nuevo == "activa":
+                # Al reconectar hay que forzar un nuevo escaneo de la unidad:
+                # sin ultima_revision la sincronizacion no puede darla por vista.
+                con.execute(
+                    "UPDATE unidades SET estado = 'activa', ultima_revision = NULL "
+                    "WHERE ruta = ?", (ruta,))
+            else:
+                con.execute(
+                    "UPDATE unidades SET estado = ? WHERE ruta = ?", (nuevo, ruta))
+            cambiado = True
+    if cambiado:
+        con.commit()
+    return cambiado
+
+
+def _marcar_revisadas(con, raices):
+    ahora = time.time()
+    for raiz in raices:
+        ruta = str(raiz)
+        if _accesible(ruta):
+            con.execute(
+                "UPDATE unidades SET ultima_revision = ?, estado = 'activa' "
+                "WHERE ruta = ?", (ahora, ruta))
 
 
 def _indexar_raices(raices, con, max_archivos):
@@ -309,10 +388,11 @@ def indexar(raices=None, max_archivos=1000000, forzar=False):
     El escaneo es completo (reconstruccion desde cero) cuando la base es
     nueva o cambio la version del indice.
     """
-    raices = raices or discos()
+    raices = [str(r) for r in (raices or discos())]
     con = database.conectar()
     try:
-        if not forzar and _reciente(con):
+        reconectadas = _sincronizar_unidades(con, raices)
+        if not forzar and not reconectadas and _reciente(con):
             return database.contar(con, "archivos")
         completo = (database.version_indice(con) != database.VERSION_INDICE
                     or database.contar(con, "carpetas") == 0)
@@ -321,6 +401,7 @@ def indexar(raices=None, max_archivos=1000000, forzar=False):
             con.execute("DELETE FROM carpetas")
             con.commit()
         estadisticas, truncado = _indexar_raices(raices, con, max_archivos)
+        _marcar_revisadas(con, raices)
         database.escribir_meta(con, "version_indice", database.VERSION_INDICE)
         for clave, valor in estadisticas.a_meta(
                 "completo" if completo else "incremental").items():
@@ -388,6 +469,10 @@ def resumen_escaneo():
         inaccesibles = json.loads(database.leer_meta(con, "carpetas_inaccesibles", "[]"))
         if inaccesibles:
             partes.append("Carpetas sin permiso: " + ", ".join(inaccesibles[:10]))
+        desconectadas = [f[0] for f in con.execute(
+            "SELECT ruta FROM unidades WHERE estado = 'desconectada'")]
+        if desconectadas:
+            partes.append("Unidades desconectadas: " + ", ".join(desconectadas))
         return " ".join(partes)
     finally:
         con.close()

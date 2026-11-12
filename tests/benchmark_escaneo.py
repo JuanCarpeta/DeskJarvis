@@ -117,6 +117,7 @@ def consistencia(db_nueva, muestra=500):
 def caso_archivo_modificado(temporal):
     """El caso fundamental: modificar un documento sin cambiar nombre ni carpeta."""
     database.DB = os.path.join(temporal, "caso.db")
+    database.inicializar()
     caja = Path(temporal) / "caja"
     caja.mkdir()
     doc = caja / "documento.txt"
@@ -152,6 +153,7 @@ def main():
     db_nueva = os.path.join(temporal, "nueva.db")
     db_vieja = os.path.join(temporal, "vieja.db")
     database.DB = db_nueva
+    database.inicializar()
     scanner.SEG_ENTRE_ESCANEOS = 0
 
     total_viejo, t_viejo, mem_viejo, _ = medir(escaneo_antiguo, raiz, db_vieja)

@@ -19,3 +19,6 @@ PALABRAS_APAGAR = {"apagar", "salir", "apagate", "apagar jarvis", "cerrar jarvis
 
 #Evitar abrir dos jarvis
 PUERTO_UNICO = 48653
+
+MAX_PASOS = 4
+TEMPERATURA = 0

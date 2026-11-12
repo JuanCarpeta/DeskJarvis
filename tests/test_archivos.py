@@ -4,6 +4,7 @@ import shutil
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from core import archivos, database, scanner
 from core.scanner_errors import (
@@ -20,6 +21,7 @@ class BaseConDBTemporal(unittest.TestCase):
         self.addCleanup(self._temporal.cleanup)
         self._db_real = database.DB
         database.DB = os.path.join(self._temporal.name, "prueba.db")
+        database.inicializar()
         self._seg_real = scanner.SEG_ENTRE_ESCANEOS
         scanner.SEG_ENTRE_ESCANEOS = 0
         self.raiz = Path(self._temporal.name) / "equipo"
@@ -160,6 +162,117 @@ class TestBuscar(BaseConDBTemporal):
         self.assertEqual([r["ruta"] for r in resultados], [str(self.archivo)])
 
 
+class TestUnidades(BaseConDBTemporal):
+    def estado_unidad(self, ruta):
+        con = database.conectar()
+        try:
+            return con.execute(
+                "SELECT estado, ultima_revision FROM unidades WHERE ruta = ?",
+                (str(ruta),)).fetchone()
+        finally:
+            con.close()
+
+    def buscar_en_db(self, consulta):
+        con = database.conectar()
+        try:
+            return archivos.buscar_en_db(
+                con, scanner.tokens(consulta), scanner.normalizar(consulta), 10)
+        finally:
+            con.close()
+
+    def test_unidad_se_registra_al_indexar(self):
+        scanner.indexar([self.raiz])
+        estado, revision = self.estado_unidad(self.raiz)
+        self.assertEqual(estado, "activa")
+        self.assertIsNotNone(revision)
+
+    def test_unidad_desconectada_conserva_filas_pero_no_aparece(self):
+        scanner.indexar([self.raiz])
+        self.assertEqual(len(self.buscar_en_db("informe")), 1)
+        shutil.rmtree(self.raiz)
+        scanner.indexar([self.raiz])
+        self.assertEqual(self.estado_unidad(self.raiz)[0], "desconectada")
+        self.assertIn(str(self.archivo), self.rutas_en_db())
+        self.assertEqual(self.buscar_en_db("informe"), [])
+
+    def test_busqueda_ignora_unidad_desconectada_y_conserva_la_activa(self):
+        otra = Path(self._temporal.name) / "otra"
+        otra.mkdir()
+        otro_archivo = otra / "informe-otro.txt"
+        otro_archivo.write_text("otro", encoding="utf-8")
+        scanner.indexar([self.raiz, otra])
+        shutil.rmtree(self.raiz)
+        resultados = self.buscar_en_db("informe")
+        self.assertEqual([r["ruta"] for r in resultados], [str(otro_archivo)])
+
+    def test_desconexion_se_refleja_en_la_siguiente_busqueda(self):
+        scanner.indexar([self.raiz])
+        self.assertEqual(len(self.buscar_en_db("informe")), 1)
+        shutil.rmtree(self.raiz)
+        self.assertEqual(self.buscar_en_db("informe"), [])
+        self.assertEqual(self.estado_unidad(self.raiz)[0], "desconectada")
+
+    def test_reconexion_se_refleja_en_la_siguiente_busqueda(self):
+        scanner.indexar([self.raiz])
+        shutil.rmtree(self.raiz)
+        self.buscar_en_db("informe")
+        self.docs.mkdir(parents=True)
+        self.archivo.write_text("hola", encoding="utf-8")
+        self.assertEqual(len(self.buscar_en_db("informe")), 1)
+        self.assertEqual(self.estado_unidad(self.raiz)[0], "activa")
+
+    def test_desconexion_se_detecta_aunque_el_escaneo_sea_reciente(self):
+        scanner.indexar([self.raiz])
+        shutil.rmtree(self.raiz)
+        scanner.SEG_ENTRE_ESCANEOS = 3600
+        scanner.indexar([self.raiz])
+        self.assertEqual(self.estado_unidad(self.raiz)[0], "desconectada")
+
+    def test_unidad_ausente_de_discos_se_marca_desconectada(self):
+        scanner.indexar([self.raiz])
+        shutil.rmtree(self.raiz)
+        with mock.patch("core.scanner.discos", return_value=[]):
+            scanner.indexar()
+        self.assertEqual(self.estado_unidad(self.raiz)[0], "desconectada")
+        self.assertIn("Unidades desconectadas", scanner.resumen_escaneo())
+
+    def test_reconexion_fuerza_escaneo_y_vuelve_a_buscar(self):
+        scanner.indexar([self.raiz])
+        shutil.rmtree(self.raiz)
+        scanner.indexar([self.raiz])
+        self.docs.mkdir(parents=True)
+        self.archivo.write_text("hola de nuevo", encoding="utf-8")
+        scanner.SEG_ENTRE_ESCANEOS = 3600
+        scanner.indexar([self.raiz])
+        self.assertEqual(self.estado_unidad(self.raiz)[0], "activa")
+        self.assertEqual(len(self.buscar_en_db("informe")), 1)
+
+    def test_reconexion_detectada_por_busqueda_fuerza_nuevo_escaneo(self):
+        scanner.indexar([self.raiz])
+        self.assertEqual(len(self.buscar_en_db("informe")), 1)
+
+        shutil.rmtree(self.raiz)
+        self.assertEqual(self.buscar_en_db("informe"), [])
+        self.assertEqual(self.estado_unidad(self.raiz)[0], "desconectada")
+
+        self.docs.mkdir(parents=True)
+        self.archivo.write_text("hola de nuevo", encoding="utf-8")
+        nuevo = self.docs / "creado-offline.txt"
+        nuevo.write_text("nuevo", encoding="utf-8")
+
+        self.assertEqual(len(self.buscar_en_db("informe")), 1)
+        estado, revision = self.estado_unidad(self.raiz)
+        self.assertEqual(estado, "activa")
+        self.assertIsNone(revision)
+
+        scanner.SEG_ENTRE_ESCANEOS = 3600
+        scanner.indexar([self.raiz])
+
+        self.assertIsNotNone(self.estado_unidad(self.raiz)[1])
+        self.assertIn(str(nuevo), self.rutas_en_db())
+        self.assertEqual(len(self.buscar_en_db("creado")), 1)
+
+
 class TestEstadisticas(BaseConDBTemporal):
     def test_guarda_estadisticas_del_ultimo_escaneo(self):
         scanner.indexar([self.raiz])
@@ -249,6 +362,29 @@ class TestEnlacesYRutas(BaseConDBTemporal):
             self.skipTest("la ruta generada no supera el limite clasico")
         scanner.indexar([self.raiz])
         self.assertIn(str(profundo), self.rutas_en_db())
+
+
+class TestListarEInfo(BaseConDBTemporal):
+    def test_listar_muestra_contenido_real(self):
+        texto = archivos.listar(str(self.docs))
+        self.assertIn("informe.txt", texto)
+        self.assertIn("[archivo]", texto)
+
+    def test_listar_carpeta_vacia(self):
+        vacia = self.raiz / "vacia"
+        vacia.mkdir()
+        self.assertIn("vacia", archivos.listar(str(vacia)).lower())
+
+    def test_listar_ruta_inexistente(self):
+        self.assertIn("No existe", archivos.listar(str(self.raiz / "nada")))
+
+    def test_info_devuelve_datos_reales(self):
+        texto = archivos.info(str(self.archivo))
+        self.assertIn("4 bytes", texto)
+        self.assertIn("archivo", texto)
+
+    def test_info_carpeta(self):
+        self.assertIn("carpeta", archivos.info(str(self.docs)))
 
 
 if __name__ == "__main__":

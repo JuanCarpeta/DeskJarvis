@@ -12,13 +12,24 @@ VERSION_INDICE = "3"
 
 
 def conectar():
+    """Abre una conexion configurada. No crea tablas ni aplica migraciones."""
     con = sqlite3.connect(DB)
-    # WAL permite escribir sin bloquear lecturas; NORMAL acelera las escrituras.
-    con.execute("PRAGMA journal_mode=WAL")
+    # NORMAL acelera las escrituras y el timeout evita fallos por bloqueos.
     con.execute("PRAGMA synchronous=NORMAL")
     con.execute("PRAGMA busy_timeout=5000")
-    _asegurar_esquema(con)
     return con
+
+
+def inicializar():
+    """Crea el esquema y aplica las migraciones. Se llama una vez al arrancar."""
+    con = conectar()
+    try:
+        # WAL persiste en la base: basta con establecerlo al inicializar.
+        con.execute("PRAGMA journal_mode=WAL")
+        _asegurar_esquema(con)
+        con.commit()
+    finally:
+        con.close()
 
 
 def _asegurar_esquema(con):
@@ -48,8 +59,13 @@ def _asegurar_esquema(con):
         con.execute("DROP TABLE carpetas")
         con.execute("CREATE TABLE carpetas (ruta TEXT PRIMARY KEY, firma TEXT)")
     con.execute("CREATE TABLE IF NOT EXISTS meta (clave TEXT PRIMARY KEY, valor TEXT)")
-    con.commit()
-    return con
+    con.execute(
+        """CREATE TABLE IF NOT EXISTS unidades (
+               ruta TEXT PRIMARY KEY,
+               ultima_revision REAL,
+               estado TEXT
+           )"""
+    )
 
 
 def leer_meta(con, clave, defecto=None):
@@ -63,6 +79,14 @@ def escribir_meta(con, clave, valor):
 
 def version_indice(con):
     return leer_meta(con, "version_indice", "")
+
+
+def leer_unidades(con):
+    """Rutas indexadas y su estado; vacio en bases creadas antes de esta tabla."""
+    try:
+        return con.execute("SELECT ruta, estado FROM unidades").fetchall()
+    except sqlite3.OperationalError:
+        return []
 
 
 def contar(con, tabla):

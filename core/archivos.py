@@ -6,10 +6,13 @@ core/database.py; este modulo es solo la cara visible que usa el cerebro.
 
 import os
 import re
+from datetime import datetime
 from pathlib import Path
 
 from core import database
-from core.scanner import buscar_en_vivo, indexar, normalizar, puntuar, tokens
+from core.scanner import (
+    buscar_en_vivo, indexar, normalizar, puntuar, refrescar_unidades, tokens,
+)
 
 EXT_TEXTO = {
     ".txt", ".md", ".csv", ".log", ".json", ".xml", ".html", ".htm",
@@ -83,7 +86,23 @@ def resolver_objetivo(texto):
     return extraer_ruta(texto) or ruta_conocida(texto)
 
 
+def _base_unidad(ruta):
+    base = os.path.normcase(os.path.abspath(ruta))
+    if not base.endswith(os.sep):
+        base += os.sep
+    return base
+
+
+def _patron_unidad(base):
+    escapado = base.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    return escapado + "%"
+
+
 def buscar_en_db(con, tokens_consulta, consulta_norm, limite):
+    refrescar_unidades(con)
+    unidades = database.leer_unidades(con)
+    offline = [_base_unidad(ruta) for ruta, estado in unidades
+               if estado != "activa"]
     # Cada palabra debe aparecer como palabra completa dentro del nombre,
     # asi "taller" ya no confunde con "installer".
     sql = "SELECT ruta, nombre, nombre_norm, tamano, modificado FROM archivos WHERE 1=1"
@@ -91,6 +110,10 @@ def buscar_en_db(con, tokens_consulta, consulta_norm, limite):
     for t in tokens_consulta[:6]:
         sql += " AND nombre_norm LIKE ?"
         params.append(f"% {t}%")
+    if offline:
+        sql += " AND NOT (" + " OR ".join(
+            "ruta LIKE ? ESCAPE '\\'" for _ in offline) + ")"
+        params.extend(_patron_unidad(base) for base in offline)
     sql += " LIMIT 3000"
     filas = con.execute(sql, params).fetchall()
     if not filas:
@@ -270,3 +293,46 @@ def leer(ruta, max_chars=4000):
     except Exception as e:
         return f"Error al leer: {e}"
     return " ".join(texto.split())[:max_chars]
+
+
+def listar(ruta):
+    """Lista el contenido real de una carpeta."""
+    p = Path(ruta)
+    if not p.exists():
+        return f"No existe: {ruta}"
+    if not p.is_dir():
+        return f"{p} es un archivo, no una carpeta."
+    try:
+        elementos = sorted(p.iterdir(), key=lambda x: (not x.is_dir(), x.name.lower()))
+    except OSError as e:
+        return f"No pude listar {p}: {e}"
+    if not elementos:
+        return f"La carpeta {p} esta vacia."
+    lineas = [
+        f"{'[carpeta]' if x.is_dir() else '[archivo]'} {x.name}"
+        for x in elementos[:100]
+    ]
+    resto = len(elementos) - 100
+    if resto > 0:
+        lineas.append(f"... y {resto} mas.")
+    return f"Contenido de {p}:\n" + "\n".join(lineas)
+
+
+def info(ruta):
+    """Tamano, fecha de modificacion y tipo real de un archivo o carpeta."""
+    p = Path(ruta)
+    if not p.exists():
+        return f"No existe: {ruta}"
+    try:
+        datos = p.stat()
+    except OSError as e:
+        return f"No pude leer {p}: {e}"
+    fecha = datetime.fromtimestamp(datos.st_mtime).strftime("%Y-%m-%d %H:%M")
+    if p.is_dir():
+        return f"{p} es una carpeta, modificada el {fecha}."
+    tam = f"{datos.st_size} bytes"
+    if datos.st_size >= 1024 * 1024:
+        tam += f" ({datos.st_size / (1024 * 1024):.1f} MB)"
+    elif datos.st_size >= 1024:
+        tam += f" ({datos.st_size / 1024:.1f} KB)"
+    return f"{p} es un archivo de {tam}, modificado el {fecha}."
